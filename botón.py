@@ -489,4 +489,206 @@ def show_delete_channels_menu(chat_id, message_id):
 
 
 # ================= ENTRADA DE DATOS Y MENSAJES =================
-@bot.message_handler(c
+@bot.message_handler(content_types=["text", "photo", "video", "document", "animation"])
+def handle_inputs(message):
+    uid = message.from_user.id
+    state = user_states.get(uid)
+    if not state:
+        return
+
+    # --- Solicitud de canal (Usuario o Owner) ---
+    if state in ("waiting_user_channel", "waiting_owner_channel"):
+        chat_identifier = None
+        if message.forward_from_chat:
+            chat_identifier = message.forward_from_chat.id
+        elif message.text:
+            text = message.text.strip()
+            if "t.me/" in text and not text.startswith("@"):
+                slug = text.split("t.me/")[-1].split("/")[0]
+                if not slug.startswith("+"):
+                    chat_identifier = f"@{slug}"
+            else:
+                chat_identifier = text
+
+        if not chat_identifier:
+            bot.reply_to(message, "⚠️ Reenvía un mensaje de tu canal o envía su <code>@username</code> / ID.")
+            return
+
+        wait_msg = bot.reply_to(message, "🔍 Verificando permisos y generando enlace de invitación...")
+        ok, result = verify_and_setup_channel(chat_identifier)
+
+        if not ok:
+            bot.edit_message_text(result, message.chat.id, wait_msg.message_id)
+            return
+
+        user_states.pop(uid, None)
+
+        # Si lo añade directamente el Owner
+        if state == "waiting_owner_channel" and uid == OWNER_ID:
+            db["channels"] = [c for c in db["channels"] if c["id"] != result["id"]]
+            db["channels"].append(result)
+            save_db()
+            bot.edit_message_text(
+                f"✅ Canal <b>{result['title']}</b> añadido directamente a la botonera.\n🔗 Enlace creado: {result['invite_link']}",
+                message.chat.id,
+                wait_msg.message_id
+            )
+            show_owner_panel(message.chat.id)
+            return
+
+        # Si es solicitud de un usuario, enviarla al Owner
+        ch_id_str = str(result["id"])
+        db["pending"][ch_id_str] = {
+            "id": result["id"],
+            "title": result["title"],
+            "invite_link": result["invite_link"],
+            "user_id": uid
+        }
+        save_db()
+
+        bot.edit_message_text(
+            f"✅ <b>¡Solicitud enviada con éxito!</b>\n\n"
+            f"📢 <b>Canal:</b> {result['title']}\n"
+            f"⏳ El administrador revisará tu canal y te notificaremos cuando sea aceptado.",
+            message.chat.id,
+            wait_msg.message_id
+        )
+
+        # Notificar al Owner
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Aceptar", callback_data=f"approve_{ch_id_str}"),
+            InlineKeyboardButton("❌ Rechazar", callback_data=f"reject_{ch_id_str}")
+        )
+        owner_notif = (
+            "🔔 <b>NUEVA SOLICITUD DE CANAL</b>\n\n"
+            f"👤 <b>Solicitante:</b> {message.from_user.first_name} (<code>{uid}</code>)\n"
+            f"📢 <b>Canal:</b> {result['title']}\n"
+            f"🆔 <b>ID:</b> <code>{result['id']}</code>\n"
+            f"🔗 <b>Enlace creado por el bot:</b> {result['invite_link']}"
+        )
+        bot.send_message(OWNER_ID, owner_notif, reply_markup=markup)
+        return
+
+    # --- Ajustes exclusivos del Owner ---
+    if uid != OWNER_ID:
+        return
+
+    if state == "waiting_desc" and message.text:
+        db["config"]["description"] = message.text
+        save_db()
+        user_states.pop(uid, None)
+        bot.reply_to(message, "✅ Descripción actualizada y guardada en GitHub Gist.")
+        show_owner_panel(message.chat.id)
+
+    elif state == "waiting_photo":
+        if message.text and message.text.strip().upper() == "QUITAR":
+            db["config"]["photo"] = None
+            save_db()
+            user_states.pop(uid, None)
+            bot.reply_to(message, "✅ Foto eliminada de la botonera.")
+            show_owner_panel(message.chat.id)
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+            db["config"]["photo"] = file_id
+            save_db()
+            user_states.pop(uid, None)
+            bot.reply_to(message, "✅ Foto actualizada y guardada en GitHub Gist.")
+            show_owner_panel(message.chat.id)
+        else:
+            bot.reply_to(message, "⚠️ Envía una imagen válida o escribe <code>QUITAR</code>.")
+
+    elif state == "waiting_time" and message.text:
+        text = message.text.strip()
+        try:
+            datetime.strptime(text, "%H:%M")
+            db["config"]["post_time"] = text
+            db["config"]["last_run_date"] = ""  # Permitir que corra hoy si la hora aún no pasa
+            save_db()
+            user_states.pop(uid, None)
+            bot.reply_to(message, f"✅ Hora de publicación configurada a las <b>{text}</b>.")
+            show_owner_panel(message.chat.id)
+        except ValueError:
+            bot.reply_to(message, "❌ Formato inválido. Usa <b>HH:MM</b> en formato 24h (ejemplo: <code>14:30</code>).")
+
+    elif state == "waiting_dur" and message.text:
+        try:
+            horas = float(message.text.strip())
+            if horas <= 0:
+                raise ValueError
+            db["config"]["duration_hours"] = horas
+            save_db()
+            user_states.pop(uid, None)
+            bot.reply_to(message, f"✅ Duración configurada a <b>{horas} horas</b>.")
+            show_owner_panel(message.chat.id)
+        except ValueError:
+            bot.reply_to(message, "❌ Envía un número válido de horas (ejemplo: <code>2</code> o <code>1.5</code>).")
+
+
+# ================= RELOJ AUTOMÁTICO (PUBLICACIÓN Y BORRADO) =================
+def scheduler_loop():
+    """Bucle en segundo plano que revisa cada 20 segundos si toca publicar o borrar."""
+    tz = pytz.timezone(TIMEZONE)
+    while True:
+        try:
+            now_ts = time.time()
+
+            # 1. Revisar si ya pasó el tiempo de publicidad para auto-eliminar
+            if db["active_promo"]["active"] and now_ts >= db["active_promo"]["delete_at"]:
+                print("⏰ Tiempo de publicidad finalizado. Eliminando mensajes...")
+                deleted = delete_active_botonera()
+                try:
+                    bot.send_message(OWNER_ID, f"🧹 Tiempo de publicidad cumplido. Se eliminaron <b>{deleted}</b> publicaciones automáticamente.")
+                except Exception:
+                    pass
+
+            # 2. Revisar si es la hora y el día de publicar la botonera
+            now_dt = datetime.now(tz)
+            current_hm = now_dt.strftime("%H:%M")
+            today_str = now_dt.strftime("%Y-%m-%d")
+            current_weekday = now_dt.weekday()  # 0=Lunes ... 6=Domingo
+
+            if (
+                not db["active_promo"]["active"]
+                and current_weekday in db["config"]["days"]
+                and current_hm == db["config"]["post_time"]
+                and db["config"]["last_run_date"] != today_str
+                and len(db["channels"]) > 0
+            ):
+                print("🚀 Hora programada alcanzada. Publicando botonera...")
+                db["config"]["last_run_date"] = today_str
+                save_db()
+                total = publish_botonera_all()
+                try:
+                    bot.send_message(
+                        OWNER_ID,
+                        f"📢 <b>Botonera publicada automáticamente</b> en <b>{total}</b> canales.\n"
+                        f"⏳ Se eliminará en {db['config']['duration_hours']} horas."
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"⚠️ Error en el programador: {e}")
+
+        time.sleep(20)
+
+
+# ================= SERVIDOR WEB PARA RENDER Y UPTIMEROBOT =================
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot Botonera Activo 24/7", 200
+
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
+
+
+if __name__ == "__main__":
+    load_db()
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    print("🤖 Bot iniciado correctamente...")
+    bot.infinity_polling(timeout=20, long_polling_timeout=10)
