@@ -13,7 +13,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GIST_ID = os.environ.get("GIST_ID", "")
+GIST_ID = os.environ.get("GIST_ID", "d1970165d5c0a39051c45e535a07f2c1")
 GIST_FILENAME = os.environ.get("GIST_FILENAME", "botonera_db.json")
 TIMEZONE = os.environ.get("TIMEZONE", "America/Santo_Domingo")
 PORT = int(os.environ.get("PORT", 8080))
